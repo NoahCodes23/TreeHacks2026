@@ -62,6 +62,7 @@ image = (
         "libgl1-mesa-glx",
         "wget",
         "curl",
+        "clang",
     )
     # Build tools first (rarely change)
     .pip_install(
@@ -103,6 +104,7 @@ image = (
         "protobuf",
         "moviepy==1.0.3",
         "angelslim==0.2.2",
+        "sageattention",
         # FastAPI for web endpoints
         "fastapi[standard]",
     )
@@ -404,9 +406,12 @@ def download_models():
     return {"status": "success", "model_path": HUNYUAN_DIR, "worldplay_path": WORLDPLAY_DIR}
 
 
+N_GPUS = 4  # Number of GPUs for sequence-parallel inference (must divide attention head count: 1, 2, 4, or 8)
+
+
 @app.cls(
     image=image,
-    gpu="H200",  # Use single H200 GPU for inference (simpler, works with Modal)
+    gpu=f"H200:{N_GPUS}",
     volumes={MODELS_DIR: model_volume, CODE_DIR: code_volume},
     timeout=1800,  # 30 minute timeout
     scaledown_window=300,  # Keep warm for 5 minutes
@@ -415,64 +420,28 @@ class WorldPlayInference:
     """
     WorldPlay inference class for Modal.
 
-    Uses the distilled autoregressive model for fast inference.
+    Uses torchrun to launch 8 GPU processes with sequence parallelism,
+    matching the official run.sh approach.
     """
 
     @modal.enter()
-    def load_model(self):
-        """Load the model when container starts."""
-        import sys
-        sys.path.insert(0, CODE_DIR)
-
-        import torch
-        import argparse
-        from hyvideo.pipelines.worldplay_video_pipeline import HunyuanVideo_1_5_Pipeline
-        from hyvideo.commons.parallel_states import initialize_parallel_state
-        from hyvideo.commons.infer_state import initialize_infer_state
-
-        # Initialize parallel state for single GPU (Modal doesn't support torchrun-style distributed)
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["RANK"] = "0"
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "29500"
-
-        # Initialize with sp=1 for single GPU
-        initialize_parallel_state(sp=1)
-        torch.cuda.set_device(0)
-
-        # Initialize inference state with default args
-        args = argparse.Namespace(
-            use_sageattn=False,
-            sage_blocks_range="0-39",  # Default range for all blocks
-            enable_torch_compile=False,
-            use_fp8_gemm=False,
-            quant_type="fp8_e4m3",
-            include_patterns="double_blocks",
-            use_vae_parallel=False,
-            few_step=True,
-            num_inference_steps=4,
-        )
-        initialize_infer_state(args)
-
-        print("Loading HY-WorldPlay model on H200 GPU...")
-
-        # Action model checkpoint path (distilled for faster inference)
+    def setup(self):
+        """Verify model files exist when container starts."""
         action_ckpt = f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors"
-
-        # Initialize the pipeline using the class method
-        self.pipeline = HunyuanVideo_1_5_Pipeline.create_pipeline(
-            pretrained_model_name_or_path=HUNYUAN_DIR,
-            transformer_version="480p_i2v",
-            enable_offloading=False,
-            enable_group_offloading=False,  # H200 has enough VRAM; no offloading needed
-            create_sr_pipeline=False,
-            force_sparse_attn=False,
-            transformer_dtype=torch.bfloat16,
-            action_ckpt=action_ckpt,
-        )
-
-        print("✅ Model loaded successfully!")
+        required = [
+            f"{HUNYUAN_DIR}/transformer/480p_i2v",
+            f"{HUNYUAN_DIR}/vae",
+            f"{HUNYUAN_DIR}/scheduler",
+            f"{HUNYUAN_DIR}/text_encoder/llm",
+            f"{HUNYUAN_DIR}/vision_encoder/siglip",
+            action_ckpt,
+        ]
+        missing = [p for p in required if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing model files: {missing}. Run 'modal run modal_app.py::download_models' first."
+            )
+        print(f"✅ All model files verified. Ready for {N_GPUS}-GPU inference.")
 
     @modal.method()
     def generate(
@@ -485,9 +454,10 @@ class WorldPlayInference:
         height: int = 480,
         seed: int = 42,
         num_inference_steps: int = 4,
+        fps: int = 24,
     ) -> bytes:
         """
-        Generate a video from an image and prompt.
+        Generate a video from an image and prompt using 8-GPU torchrun.
 
         Args:
             image_bytes: Input image as bytes
@@ -502,20 +472,12 @@ class WorldPlayInference:
         Returns:
             Generated video as MP4 bytes
         """
-        import sys
-        sys.path.insert(0, CODE_DIR)
-
-        import torch
+        import subprocess
         import tempfile
         from PIL import Image
         import io
-        import imageio
-        import einops
 
-        # Import pose_to_input from generate.py
-        from hyvideo.generate import pose_to_input
-
-        # Load image and save to temporary file
+        # Save input image to temp file
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         image = image.resize((width, height))
 
@@ -523,58 +485,95 @@ class WorldPlayInference:
             image_path = f.name
             image.save(image_path)
 
-        print(f"Generating video: {num_frames} frames, {width}x{height}")
+        # Output directory for torchrun (rank 0 saves to gen.mp4)
+        output_dir = tempfile.mkdtemp(prefix="modal_output_")
+
+        action_ckpt = f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors"
+
+        print(f"Generating video: {num_frames} frames, {width}x{height}, {N_GPUS} GPUs")
         print(f"Prompt: {prompt}")
         print(f"Pose: {pose}")
 
-        # Calculate number of latents
-        latent_num = (num_frames - 1) // 4 + 1
+        # Build torchrun command matching run.sh
+        cmd = [
+            "torchrun",
+            f"--nproc_per_node={N_GPUS}",
+            f"{CODE_DIR}/hyvideo/generate.py",
+            "--prompt", prompt,
+            "--image_path", image_path,
+            "--resolution", "480p",
+            "--aspect_ratio", "16:9",
+            "--video_length", str(num_frames),
+            "--seed", str(seed),
+            "--rewrite", "false",
+            "--sr", "false",
+            "--pose", pose,
+            "--output_path", output_dir,
+            "--model_path", HUNYUAN_DIR,
+            "--action_ckpt", action_ckpt,
+            "--few_step", "true",
+            "--num_inference_steps", str(num_inference_steps),
+            "--model_type", "ar",
+            "--offloading", "false",
+            "--group_offloading", "false",
+            "--use_vae_parallel", "false",
+            "--use_sageattn", "false",
+            "--use_fp8_gemm", "false",
+            "--enable_torch_compile", "false",
+            "--fps", str(fps),
+            "--width", str(width),
+            "--height", str(height),
+        ]
 
-        # Convert pose to input tensors
-        viewmats, Ks, action = pose_to_input(pose, latent_num)
+        env = os.environ.copy()
+        env["PYTHONPATH"] = CODE_DIR + ":" + env.get("PYTHONPATH", "")
+        env["PYTHONUNBUFFERED"] = "1"
 
-        # Generate video
-        with torch.no_grad():
-            out = self.pipeline(
-                enable_sr=False,
-                prompt=prompt,
-                aspect_ratio="16:9",
-                num_inference_steps=num_inference_steps,
-                video_length=num_frames,
-                negative_prompt="",
-                seed=seed,
-                output_type="pt",
-                prompt_rewrite=False,
-                viewmats=viewmats.unsqueeze(0),
-                Ks=Ks.unsqueeze(0),
-                action=action.unsqueeze(0),
-                few_step=True,
-                chunk_latent_frames=4,
-                model_type="ar",
-                user_height=height,
-                user_width=width,
-                reference_image=image_path,
-            )
+        import sys
 
-        # Clean up temp image file
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env=env,
+        )
+
+        # Read and print output in real time
+        # Using os.read() to avoid Python's internal buffering that causes
+        # for-loop and readline() to batch output in ~8KB chunks
+        import os as _os
+        while True:
+            chunk = _os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+
+        proc.wait()
+
+        # Clean up temp image
         os.unlink(image_path)
 
-        # Save to temporary file and read bytes
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            output_path = f.name
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"torchrun failed with return code {proc.returncode}"
+            )
 
-        # Save video using imageio
-        video = out.videos
-        if video.ndim == 5:
-            video = video[0]
-        vid = (video * 255).clamp(0, 255).to(torch.uint8)
-        vid = einops.rearrange(vid, "c f h w -> f h w c")
-        imageio.mimwrite(output_path, vid.cpu().numpy(), fps=24)
+        # Read the output video (rank 0 saves to output_dir/gen.mp4)
+        video_path = os.path.join(output_dir, "gen.mp4")
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(
+                f"Expected output at {video_path} but not found. "
+                f"Contents of {output_dir}: {os.listdir(output_dir)}"
+            )
 
-        with open(output_path, "rb") as f:
+        with open(video_path, "rb") as f:
             video_bytes = f.read()
 
-        os.unlink(output_path)
+        # Clean up output
+        import shutil
+        shutil.rmtree(output_dir, ignore_errors=True)
 
         print(f"✅ Video generated: {len(video_bytes)} bytes")
         return video_bytes
@@ -587,6 +586,7 @@ def generate(
     pose: str = "w-31",
     num_frames: int = 125,
     seed: int = 42,
+    fps: int = 24,
     output_path: str = "./outputs/modal_output.mp4",
 ):
     """
@@ -613,6 +613,7 @@ def generate(
         pose=pose,
         num_frames=num_frames,
         seed=seed,
+        fps=fps,
     )
 
     # Save output video
@@ -626,7 +627,7 @@ def generate(
 # Web endpoint for API access
 @app.function(
     image=image,
-    gpu="H200",  # Use single H200 GPU for inference
+    gpu=f"H200:{N_GPUS}",
     volumes={MODELS_DIR: model_volume, CODE_DIR: code_volume},
     timeout=1800,
     scaledown_window=300,
@@ -634,7 +635,7 @@ def generate(
 @modal.fastapi_endpoint(method="POST")
 def generate_video_api(request: dict):
     """
-    Web API endpoint for video generation.
+    Web API endpoint for video generation using 8-GPU torchrun.
 
     Deploy with: modal deploy modal_app.py
 
@@ -653,46 +654,12 @@ def generate_video_api(request: dict):
     }
     """
     import base64
+    import subprocess
     import sys
-    sys.path.insert(0, CODE_DIR)
-
-    import torch
+    import shutil
     import tempfile
-    import imageio
-    import einops
     from PIL import Image
     import io
-    import argparse
-
-    from hyvideo.pipelines.worldplay_video_pipeline import HunyuanVideo_1_5_Pipeline
-    from hyvideo.commons.parallel_states import initialize_parallel_state
-    from hyvideo.commons.infer_state import initialize_infer_state
-    from hyvideo.generate import pose_to_input
-
-    # Initialize parallel state for single GPU
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["RANK"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "29500"
-
-    # Initialize with sp=1 for single GPU
-    initialize_parallel_state(sp=1)
-    torch.cuda.set_device(0)
-
-    # Initialize inference state
-    args = argparse.Namespace(
-        use_sageattn=False,
-        sage_blocks_range="0-39",  # Default range for all blocks
-        enable_torch_compile=False,
-        use_fp8_gemm=False,
-        quant_type="fp8_e4m3",
-        include_patterns="double_blocks",
-        use_vae_parallel=False,
-        few_step=True,
-        num_inference_steps=4,
-    )
-    initialize_infer_state(args)
 
     # Decode image
     image_base64 = request.get("image_base64", "")
@@ -705,8 +672,9 @@ def generate_video_api(request: dict):
     width = request.get("width", 832)
     height = request.get("height", 480)
     num_inference_steps = request.get("num_inference_steps", 4)
+    fps = request.get("fps", 24)
 
-    # Load image
+    # Save input image to temp file
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image = image.resize((width, height))
 
@@ -714,69 +682,81 @@ def generate_video_api(request: dict):
         image_path = f.name
         image.save(image_path)
 
-    # Action model checkpoint path
+    output_dir = tempfile.mkdtemp(prefix="modal_api_output_")
     action_ckpt = f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors"
 
-    # Initialize pipeline
-    pipeline = HunyuanVideo_1_5_Pipeline.create_pipeline(
-        pretrained_model_name_or_path=HUNYUAN_DIR,
-        transformer_version="480p_i2v",
-        enable_offloading=False,
-        enable_group_offloading=False,  # H200 has enough VRAM; no offloading needed
-        create_sr_pipeline=False,
-        force_sparse_attn=False,
-        transformer_dtype=torch.bfloat16,
-        action_ckpt=action_ckpt,
+    cmd = [
+        "torchrun",
+        f"--nproc_per_node={N_GPUS}",
+        f"{CODE_DIR}/hyvideo/generate.py",
+        "--prompt", prompt,
+        "--image_path", image_path,
+        "--resolution", "480p",
+        "--aspect_ratio", "16:9",
+        "--video_length", str(num_frames),
+        "--seed", str(seed),
+        "--rewrite", "false",
+        "--sr", "false",
+        "--pose", pose,
+        "--output_path", output_dir,
+        "--model_path", HUNYUAN_DIR,
+        "--action_ckpt", action_ckpt,
+        "--few_step", "true",
+        "--num_inference_steps", str(num_inference_steps),
+        "--model_type", "ar",
+        "--offloading", "false",
+        "--group_offloading", "false",
+        "--use_vae_parallel", "false",
+        "--use_sageattn", "false",
+        "--use_fp8_gemm", "false",
+        "--enable_torch_compile", "false",
+        "--fps", str(fps),
+        "--width", str(width),
+        "--height", str(height),
+    ]
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = CODE_DIR + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        env=env,
     )
 
-    # Convert pose to input tensors
-    latent_num = (num_frames - 1) // 4 + 1
-    viewmats, Ks, action = pose_to_input(pose, latent_num)
+    import os as _os
+    while True:
+        chunk = _os.read(proc.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
 
-    # Generate video
-    with torch.no_grad():
-        out = pipeline(
-            enable_sr=False,
-            prompt=prompt,
-            aspect_ratio="16:9",
-            num_inference_steps=num_inference_steps,
-            video_length=num_frames,
-            negative_prompt="",
-            seed=seed,
-            output_type="pt",
-            prompt_rewrite=False,
-            viewmats=viewmats.unsqueeze(0),
-            Ks=Ks.unsqueeze(0),
-            action=action.unsqueeze(0),
-            few_step=True,
-            chunk_latent_frames=4,
-            model_type="ar",
-            user_height=height,
-            user_width=width,
-            reference_image=image_path,
-        )
+    proc.wait()
 
-    # Clean up temp image
     os.unlink(image_path)
 
-    # Save video
-    video = out.videos
-    if video.ndim == 5:
-        video = video[0]
-    vid = (video * 255).clamp(0, 255).to(torch.uint8)
-    vid = einops.rearrange(vid, "c f h w -> f h w c")
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"torchrun failed with return code {proc.returncode}"
+        )
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-        output_path = f.name
-    imageio.mimwrite(output_path, vid.cpu().numpy(), fps=24)
+    video_path = os.path.join(output_dir, "gen.mp4")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(
+            f"Expected output at {video_path} but not found. "
+            f"Contents of {output_dir}: {os.listdir(output_dir)}"
+        )
 
-    with open(output_path, "rb") as f:
+    with open(video_path, "rb") as f:
         video_bytes = f.read()
-    os.unlink(output_path)
 
-    # Encode response
+    shutil.rmtree(output_dir, ignore_errors=True)
+
     video_base64 = base64.b64encode(video_bytes).decode("utf-8")
-
     return {"video_base64": video_base64}
 
 

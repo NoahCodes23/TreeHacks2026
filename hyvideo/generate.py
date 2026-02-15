@@ -283,13 +283,13 @@ def pose_to_input(pose_data, latent_num, tps=False):
     return torch.as_tensor(w2c_list), torch.as_tensor(intrinsic_list), action_one_label
 
 
-def save_video(video, path):
+def save_video(video, path, fps=24):
     if video.ndim == 5:
         assert video.shape[0] == 1
         video = video[0]
     vid = (video * 255).clamp(0, 255).to(torch.uint8)
     vid = einops.rearrange(vid, "c f h w -> f h w c")
-    imageio.mimwrite(path, vid, fps=24)
+    imageio.mimwrite(path, vid, fps=fps)
 
 
 def rank0_log(message, level):
@@ -781,16 +781,16 @@ def generate_video(args):
         final_video_path = None
 
         if enable_sr and hasattr(out, "sr_videos"):
-            save_video(out.sr_videos, save_video_sr_path)
+            save_video(out.sr_videos, save_video_sr_path, fps=args.fps)
             print(f"Saved SR video to: {save_video_sr_path}")
             video_to_process = save_video_sr_path
             final_video_path = save_video_sr_path
 
             if args.save_pre_sr_video:
-                save_video(out.videos, save_video_path)
+                save_video(out.videos, save_video_path, fps=args.fps)
                 print(f"Saved original video (before SR) to: {save_video_path}")
         else:
-            save_video(out.videos, save_video_path)
+            save_video(out.videos, save_video_path, fps=args.fps)
             print(f"Saved video to: {save_video_path}")
             video_to_process = save_video_path
             final_video_path = save_video_path
@@ -981,6 +981,12 @@ def main():
         type=int,
         default=None,
         help="width for generation (recommended to set as 832)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=24,
+        help="Output video FPS (default: 24). Lower FPS with fewer frames gives same duration with less compute.",
     )
     parser.add_argument(
         "--with-ui",
