@@ -24,6 +24,12 @@ Requirements:
 
 import modal
 import os
+import re
+import time
+import json
+from typing import Optional
+from enum import Enum
+from pydantic import BaseModel, Field, field_validator
 
 # Define the Modal app
 app = modal.App("hy-worldplay")
@@ -121,6 +127,144 @@ hf_secret = modal.Secret.from_name("huggingface-secret", required_keys=["HF_TOKE
 
 # Code paths
 CODE_DIR = "/code"
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models for API input validation
+# ---------------------------------------------------------------------------
+
+class PosePreset(str, Enum):
+    FORWARD = "w-31"
+    BACKWARD = "s-31"
+    LEFT = "a-31"
+    RIGHT = "d-31"
+    PAN_LEFT = "left-31"
+    PAN_RIGHT = "right-31"
+    LOOK_UP = "up-31"
+    LOOK_DOWN = "down-31"
+
+
+class VideoGenerateRequest(BaseModel):
+    """Request body for video generation."""
+
+    image_base64: str = Field(
+        ..., description="Base64-encoded input image (PNG or JPEG)"
+    )
+    prompt: str = Field(
+        ..., min_length=1, max_length=2000, description="Scene description"
+    )
+    pose: str = Field(
+        default="w-31",
+        description='Camera trajectory, e.g. "w-31" (forward), "s-15, right-8"',
+    )
+    num_frames: int = Field(
+        default=125, ge=5, le=500, description="Number of video frames"
+    )
+    width: int = Field(default=832, ge=256, le=1920, description="Video width")
+    height: int = Field(default=480, ge=256, le=1080, description="Video height")
+    seed: int = Field(default=42, ge=0, description="Random seed")
+    num_inference_steps: int = Field(
+        default=4, ge=1, le=50, description="Diffusion denoising steps"
+    )
+    fps: int = Field(default=24, ge=1, le=60, description="Output FPS")
+
+    @field_validator("image_base64")
+    @classmethod
+    def validate_base64(cls, v):
+        import base64 as b64
+
+        try:
+            data = b64.b64decode(v)
+            if len(data) < 100:
+                raise ValueError("Image data too small")
+            if len(data) > 50 * 1024 * 1024:
+                raise ValueError("Image data too large (>50MB)")
+        except Exception as e:
+            raise ValueError(f"Invalid base64 image: {e}")
+        return v
+
+    @field_validator("num_frames")
+    @classmethod
+    def validate_frames(cls, v):
+        if ((v - 1) // 4 + 1) % 4 != 0:
+            raise ValueError(
+                f"num_frames={v} invalid: ((num_frames - 1) // 4 + 1) must be "
+                f"divisible by 4. Valid examples: 13, 29, 45, 61, 77, 93, 109, 125"
+            )
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Torchrun progress parser — turns raw stdout into structured SSE events
+# ---------------------------------------------------------------------------
+
+class TorchrunProgressParser:
+    """Parse torchrun stdout to extract progress events for SSE streaming."""
+
+    TQDM_RE = re.compile(r"(\d+)%\|.*?\|\s*(\d+)/(\d+)")
+    TASK_BANNER_RE = re.compile(r"HunyuanVideo Generation Task")
+    MODEL_LOAD_RE = re.compile(r"HY-World 1\.5 loading from:")
+    VIDEO_SAVED_RE = re.compile(r"Saved video to:")
+
+    def __init__(self, num_inference_steps: int = 4, num_frames: int = 125):
+        self.steps_per_chunk = num_inference_steps
+        latent_frames = (num_frames - 1) // 4 + 1
+        self.total_chunks = max(latent_frames // 4, 1)
+        self._chunks_completed = 0
+        self.status = "starting"
+
+    def parse_line(self, line: str) -> list[dict]:
+        """Return a list of ``{"event": ..., "data": {...}}`` dicts."""
+        events: list[dict] = []
+
+        if self.MODEL_LOAD_RE.search(line):
+            self.status = "loading"
+            events.append(
+                {"event": "status", "data": {"status": "loading", "message": "Loading model weights..."}}
+            )
+
+        if self.TASK_BANNER_RE.search(line):
+            self.status = "generating"
+            events.append(
+                {"event": "status", "data": {"status": "generating", "message": "Starting video generation..."}}
+            )
+
+        m = self.TQDM_RE.search(line)
+        if m:
+            pct_local = int(m.group(1))
+            step = int(m.group(2))
+            total = int(m.group(3))
+
+            if pct_local == 100 or step == total:
+                self._chunks_completed += 1
+
+            overall = self._overall_pct(step, total)
+            events.append(
+                {
+                    "event": "progress",
+                    "data": {
+                        "step": step,
+                        "total_steps": total,
+                        "chunk": min(self._chunks_completed, self.total_chunks),
+                        "total_chunks": self.total_chunks,
+                        "percentage": overall,
+                    },
+                }
+            )
+
+        if self.VIDEO_SAVED_RE.search(line):
+            self.status = "encoding"
+            events.append(
+                {"event": "status", "data": {"status": "encoding", "message": "Encoding video output..."}}
+            )
+
+        return events
+
+    def _overall_pct(self, step: int, total: int) -> float:
+        chunk_frac = step / max(total, 1)
+        completed = max(0, self._chunks_completed - (1 if step == total else 0))
+        pct = (completed + chunk_frac) / max(self.total_chunks, 1) * 100
+        return min(round(pct, 1), 100.0)
 
 
 @app.function(
@@ -409,6 +553,63 @@ def download_models():
 N_GPUS = 4  # Number of GPUs for sequence-parallel inference (must divide attention head count: 1, 2, 4, or 8)
 
 
+# ---------------------------------------------------------------------------
+# Shared helpers — used by both CLI and API paths
+# ---------------------------------------------------------------------------
+
+def _build_torchrun_command(
+    image_path: str,
+    output_dir: str,
+    prompt: str,
+    pose: str = "w-31",
+    num_frames: int = 125,
+    width: int = 832,
+    height: int = 480,
+    seed: int = 42,
+    num_inference_steps: int = 4,
+    fps: int = 24,
+) -> list:
+    """Build the torchrun command list for video generation."""
+    action_ckpt = f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors"
+    return [
+        "torchrun",
+        f"--nproc_per_node={N_GPUS}",
+        f"{CODE_DIR}/hyvideo/generate.py",
+        "--prompt", prompt,
+        "--image_path", image_path,
+        "--resolution", "480p",
+        "--aspect_ratio", "16:9",
+        "--video_length", str(num_frames),
+        "--seed", str(seed),
+        "--rewrite", "false",
+        "--sr", "false",
+        "--pose", pose,
+        "--output_path", output_dir,
+        "--model_path", HUNYUAN_DIR,
+        "--action_ckpt", action_ckpt,
+        "--few_step", "true",
+        "--num_inference_steps", str(num_inference_steps),
+        "--model_type", "ar",
+        "--offloading", "false",
+        "--group_offloading", "false",
+        "--use_vae_parallel", "false",
+        "--use_sageattn", "false",
+        "--use_fp8_gemm", "false",
+        "--enable_torch_compile", "false",
+        "--fps", str(fps),
+        "--width", str(width),
+        "--height", str(height),
+    ]
+
+
+def _get_torchrun_env() -> dict:
+    """Get environment variables for torchrun."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = CODE_DIR + ":" + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
 @app.cls(
     image=image,
     gpu=f"H200:{N_GPUS}",
@@ -485,49 +686,25 @@ class WorldPlayInference:
             image_path = f.name
             image.save(image_path)
 
-        # Output directory for torchrun (rank 0 saves to gen.mp4)
         output_dir = tempfile.mkdtemp(prefix="modal_output_")
-
-        action_ckpt = f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors"
 
         print(f"Generating video: {num_frames} frames, {width}x{height}, {N_GPUS} GPUs")
         print(f"Prompt: {prompt}")
         print(f"Pose: {pose}")
 
-        # Build torchrun command matching run.sh
-        cmd = [
-            "torchrun",
-            f"--nproc_per_node={N_GPUS}",
-            f"{CODE_DIR}/hyvideo/generate.py",
-            "--prompt", prompt,
-            "--image_path", image_path,
-            "--resolution", "480p",
-            "--aspect_ratio", "16:9",
-            "--video_length", str(num_frames),
-            "--seed", str(seed),
-            "--rewrite", "false",
-            "--sr", "false",
-            "--pose", pose,
-            "--output_path", output_dir,
-            "--model_path", HUNYUAN_DIR,
-            "--action_ckpt", action_ckpt,
-            "--few_step", "true",
-            "--num_inference_steps", str(num_inference_steps),
-            "--model_type", "ar",
-            "--offloading", "false",
-            "--group_offloading", "false",
-            "--use_vae_parallel", "false",
-            "--use_sageattn", "false",
-            "--use_fp8_gemm", "false",
-            "--enable_torch_compile", "false",
-            "--fps", str(fps),
-            "--width", str(width),
-            "--height", str(height),
-        ]
-
-        env = os.environ.copy()
-        env["PYTHONPATH"] = CODE_DIR + ":" + env.get("PYTHONPATH", "")
-        env["PYTHONUNBUFFERED"] = "1"
+        cmd = _build_torchrun_command(
+            image_path=image_path,
+            output_dir=output_dir,
+            prompt=prompt,
+            pose=pose,
+            num_frames=num_frames,
+            width=width,
+            height=height,
+            seed=seed,
+            num_inference_steps=num_inference_steps,
+            fps=fps,
+        )
+        env = _get_torchrun_env()
 
         import sys
 
@@ -539,9 +716,6 @@ class WorldPlayInference:
             env=env,
         )
 
-        # Read and print output in real time
-        # Using os.read() to avoid Python's internal buffering that causes
-        # for-loop and readline() to batch output in ~8KB chunks
         import os as _os
         while True:
             chunk = _os.read(proc.stdout.fileno(), 4096)
@@ -552,7 +726,6 @@ class WorldPlayInference:
 
         proc.wait()
 
-        # Clean up temp image
         os.unlink(image_path)
 
         if proc.returncode != 0:
@@ -560,7 +733,6 @@ class WorldPlayInference:
                 f"torchrun failed with return code {proc.returncode}"
             )
 
-        # Read the output video (rank 0 saves to output_dir/gen.mp4)
         video_path = os.path.join(output_dir, "gen.mp4")
         if not os.path.exists(video_path):
             raise FileNotFoundError(
@@ -571,7 +743,6 @@ class WorldPlayInference:
         with open(video_path, "rb") as f:
             video_bytes = f.read()
 
-        # Clean up output
         import shutil
         shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -624,7 +795,8 @@ def generate(
     print(f"✅ Video saved to: {output_path}")
 
 
-# Web endpoint for API access
+# DEPRECATED: Use WorldPlayAPI instead (supports SSE streaming, CORS, proper validation).
+# Kept for backward compatibility with existing deployments.
 @app.function(
     image=image,
     gpu=f"H200:{N_GPUS}",
@@ -635,6 +807,8 @@ def generate(
 @modal.fastapi_endpoint(method="POST")
 def generate_video_api(request: dict):
     """
+    DEPRECATED: Use the WorldPlayAPI class endpoints instead.
+
     Web API endpoint for video generation using 8-GPU torchrun.
 
     Deploy with: modal deploy modal_app.py
@@ -760,6 +934,350 @@ def generate_video_api(request: dict):
     return {"video_base64": video_base64}
 
 
+# ---------------------------------------------------------------------------
+# WorldPlayAPI — SSE streaming, CORS, proper validation, designed for Next.js
+# ---------------------------------------------------------------------------
+
+_REQUIRED_MODEL_PATHS = [
+    f"{HUNYUAN_DIR}/transformer/480p_i2v",
+    f"{HUNYUAN_DIR}/vae",
+    f"{HUNYUAN_DIR}/scheduler",
+    f"{HUNYUAN_DIR}/text_encoder/llm",
+    f"{HUNYUAN_DIR}/vision_encoder/siglip",
+    f"{WORLDPLAY_DIR}/ar_distilled_action_model/diffusion_pytorch_model.safetensors",
+]
 
 
+@app.cls(
+    image=image,
+    gpu=f"H200:{N_GPUS}",
+    volumes={MODELS_DIR: model_volume, CODE_DIR: code_volume},
+    timeout=1800,
+    scaledown_window=300,
+)
+class WorldPlayAPI:
+    """Full FastAPI app with SSE streaming for real-time video generation."""
+
+    @modal.enter()
+    def setup(self):
+        missing = [p for p in _REQUIRED_MODEL_PATHS if not os.path.exists(p)]
+        if missing:
+            raise FileNotFoundError(
+                f"Missing model files: {missing}. "
+                "Run 'modal run modal_app.py::download_models' first."
+            )
+        self._video_store: dict[str, bytes] = {}
+        print(f"All model files verified. WorldPlayAPI ready ({N_GPUS} GPUs).")
+
+    @modal.asgi_app()
+    def web(self):
+        import asyncio
+        import base64
+        import subprocess
+        import tempfile
+        import threading
+        import uuid
+        import shutil
+        from io import BytesIO
+
+        from fastapi import FastAPI, HTTPException
+        from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import StreamingResponse, Response
+        from PIL import Image
+
+        api = FastAPI(
+            title="HY-WorldPlay API",
+            description="Video generation with SSE streaming",
+            version="1.0.0",
+        )
+        api.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        store = self._video_store  # closure ref
+
+        # ── helpers ───────────────────────────────────────────────
+
+        def _prepare_image(request: VideoGenerateRequest) -> tuple[str, str]:
+            """Decode image, save to temp file. Returns (image_path, output_dir)."""
+            raw = base64.b64decode(request.image_base64)
+            img = Image.open(BytesIO(raw)).convert("RGB").resize(
+                (request.width, request.height)
+            )
+            f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            img.save(f.name)
+            f.close()
+            out_dir = tempfile.mkdtemp(prefix="modal_sse_")
+            return f.name, out_dir
+
+        def _read_video(output_dir: str) -> bytes:
+            video_path = os.path.join(output_dir, "gen.mp4")
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(
+                    f"Expected output at {video_path}. "
+                    f"Dir contents: {os.listdir(output_dir)}"
+                )
+            with open(video_path, "rb") as f:
+                return f.read()
+
+        # ── routes ────────────────────────────────────────────────
+
+        @api.get("/health")
+        async def health():
+            return {"status": "ok", "gpus": N_GPUS, "model": "HY-WorldPlay"}
+
+        @api.get("/config")
+        async def config():
+            return {
+                "pose_presets": {p.name: p.value for p in PosePreset},
+                "defaults": {
+                    "num_frames": 125,
+                    "width": 832,
+                    "height": 480,
+                    "num_inference_steps": 4,
+                    "fps": 24,
+                    "seed": 42,
+                    "pose": "w-31",
+                },
+                "limits": {
+                    "max_image_size_mb": 50,
+                    "max_prompt_length": 2000,
+                    "max_num_frames": 500,
+                },
+            }
+
+        @api.post("/generate")
+        async def generate_sse(request: VideoGenerateRequest):
+            """
+            Stream generation progress via SSE, then deliver the video.
+
+            **Event types:**
+            - `status`   — `{status, message, job_id?}`
+            - `progress` — `{step, total_steps, chunk, total_chunks, percentage}`
+            - `complete` — `{video_base64, job_id, download_url, size_bytes}`
+            - `error`    — `{error, details?}`
+            """
+            job_id = uuid.uuid4().hex
+
+            async def event_stream():
+                image_path = output_dir = None
+                try:
+                    yield _sse("status", {
+                        "status": "starting",
+                        "message": "Preparing generation...",
+                        "job_id": job_id,
+                    })
+
+                    image_path, output_dir = _prepare_image(request)
+
+                    cmd = _build_torchrun_command(
+                        image_path=image_path,
+                        output_dir=output_dir,
+                        prompt=request.prompt,
+                        pose=request.pose,
+                        num_frames=request.num_frames,
+                        width=request.width,
+                        height=request.height,
+                        seed=request.seed,
+                        num_inference_steps=request.num_inference_steps,
+                        fps=request.fps,
+                    )
+                    env = _get_torchrun_env()
+                    parser = TorchrunProgressParser(
+                        num_inference_steps=request.num_inference_steps,
+                        num_frames=request.num_frames,
+                    )
+
+                    yield _sse("status", {
+                        "status": "loading",
+                        "message": "Launching torchrun...",
+                    })
+
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=0,
+                        env=env,
+                    )
+
+                    # Bridge blocking subprocess I/O → async via thread + queue
+                    queue: asyncio.Queue[str | None] = asyncio.Queue()
+                    loop = asyncio.get_event_loop()
+
+                    def _reader():
+                        buf = b""
+                        while True:
+                            chunk = os.read(proc.stdout.fileno(), 4096)
+                            if not chunk:
+                                if buf:
+                                    loop.call_soon_threadsafe(
+                                        queue.put_nowait,
+                                        buf.decode("utf-8", errors="replace"),
+                                    )
+                                loop.call_soon_threadsafe(queue.put_nowait, None)
+                                break
+                            buf += chunk
+                            while b"\n" in buf or b"\r" in buf:
+                                idx_n = buf.find(b"\n")
+                                idx_r = buf.find(b"\r")
+                                if idx_n == -1:
+                                    idx_n = len(buf)
+                                if idx_r == -1:
+                                    idx_r = len(buf)
+                                idx = min(idx_n, idx_r)
+                                line = buf[:idx].decode("utf-8", errors="replace")
+                                buf = buf[idx + 1 :]
+                                if line.strip():
+                                    loop.call_soon_threadsafe(
+                                        queue.put_nowait, line
+                                    )
+
+                    threading.Thread(target=_reader, daemon=True).start()
+
+                    # Consume lines and emit SSE events
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(queue.get(), timeout=120)
+                        except asyncio.TimeoutError:
+                            yield ": keepalive\n\n"
+                            continue
+                        if line is None:
+                            break
+                        for ev in parser.parse_line(line):
+                            yield _sse(ev["event"], ev["data"])
+
+                    proc.wait()
+
+                    if image_path and os.path.exists(image_path):
+                        os.unlink(image_path)
+
+                    if proc.returncode != 0:
+                        yield _sse("error", {
+                            "error": "Generation failed",
+                            "details": f"torchrun exit code {proc.returncode}",
+                        })
+                        return
+
+                    video_bytes = _read_video(output_dir)
+                    shutil.rmtree(output_dir, ignore_errors=True)
+                    output_dir = None
+
+                    # Store for /download endpoint (auto-expire 10 min)
+                    store[job_id] = video_bytes
+
+                    async def _expire():
+                        await asyncio.sleep(600)
+                        store.pop(job_id, None)
+
+                    asyncio.ensure_future(_expire())
+
+                    vid_b64 = base64.b64encode(video_bytes).decode("utf-8")
+                    yield _sse("status", {
+                        "status": "complete",
+                        "message": "Video generation complete",
+                    })
+                    yield _sse("complete", {
+                        "video_base64": vid_b64,
+                        "job_id": job_id,
+                        "download_url": f"/download/{job_id}",
+                        "size_bytes": len(video_bytes),
+                    })
+
+                except Exception as exc:
+                    yield _sse("error", {
+                        "error": str(exc),
+                        "details": type(exc).__name__,
+                    })
+                finally:
+                    if image_path and os.path.exists(image_path):
+                        os.unlink(image_path)
+                    if output_dir and os.path.exists(output_dir):
+                        shutil.rmtree(output_dir, ignore_errors=True)
+
+            return StreamingResponse(
+                event_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Job-ID": job_id,
+                },
+            )
+
+        @api.post("/generate/sync")
+        async def generate_sync(request: VideoGenerateRequest):
+            """Blocking endpoint — returns JSON with video_base64 (no streaming)."""
+            image_path, output_dir = _prepare_image(request)
+            try:
+                cmd = _build_torchrun_command(
+                    image_path=image_path,
+                    output_dir=output_dir,
+                    prompt=request.prompt,
+                    pose=request.pose,
+                    num_frames=request.num_frames,
+                    width=request.width,
+                    height=request.height,
+                    seed=request.seed,
+                    num_inference_steps=request.num_inference_steps,
+                    fps=request.fps,
+                )
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=0,
+                    env=_get_torchrun_env(),
+                )
+                import sys
+                while True:
+                    chunk = os.read(proc.stdout.fileno(), 4096)
+                    if not chunk:
+                        break
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+
+                proc.wait()
+                if proc.returncode != 0:
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"torchrun failed (exit code {proc.returncode})",
+                    )
+                video_bytes = _read_video(output_dir)
+                return {
+                    "video_base64": base64.b64encode(video_bytes).decode("utf-8"),
+                    "size_bytes": len(video_bytes),
+                }
+            finally:
+                if os.path.exists(image_path):
+                    os.unlink(image_path)
+                shutil.rmtree(output_dir, ignore_errors=True)
+
+        @api.get("/download/{job_id}")
+        async def download_video(job_id: str):
+            """Download a generated video by job ID (available for 10 minutes)."""
+            if job_id not in store:
+                raise HTTPException(
+                    status_code=404, detail="Video not found or expired"
+                )
+            video_bytes = store.pop(job_id)
+            return Response(
+                content=video_bytes,
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="worldplay_{job_id}.mp4"'
+                },
+            )
+
+        return api
+
+
+def _sse(event: str, data: dict) -> str:
+    """Format a single SSE frame."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
